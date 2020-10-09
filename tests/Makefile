@@ -1,7 +1,13 @@
 CC ?= gcc
+CFLAGS += -g -Wall -Werror
+
+default: accept receive
 
 accept: accept.c
-	$(CC) -fPIC $^ -o $@
+	$(CC) $(CFLAGS) -fPIC $^ -o $@
+
+receive: receive.c
+	$(CC) $(CFLAGS) -fPIC $^ -o $@
 
 clean:
-	rm accept
+	rm accept receive

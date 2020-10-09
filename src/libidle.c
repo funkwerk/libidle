@@ -1,5 +1,6 @@
 #define _GNU_SOURCE // needed for RTLD_NEXT
 
+#include <assert.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -11,6 +12,8 @@
 #include <unistd.h>
 
 static int (*next_accept)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+static ssize_t (*next_recv)(int sockfd, void *buf, size_t len, int flags);
+
 static int state_filedes;
 static int times_idle = 0;
 static int active_threads_count = 1;
@@ -36,6 +39,10 @@ __attribute__ ((constructor))
 void libidle_init()
 {
   next_accept = dlsym(RTLD_NEXT, "accept");
+  assert(next_accept);
+
+  next_recv = dlsym(RTLD_NEXT, "recv");
+  assert(next_recv);
 
   char *statefile = getenv("LIBIDLE_STATEFILE");
   if (!statefile) statefile = ".libidle_state";
@@ -68,10 +75,21 @@ static void libidle_left_blocked_op()
   pthread_mutex_unlock(&mutex);
 }
 
+//
+// function proxies
+//
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 {
   libidle_entering_blocked_op();
   int ret = next_accept(sockfd, addr, addrlen);
+  libidle_left_blocked_op();
+  return ret;
+}
+
+ssize_t recv(int sockfd, void *buf, size_t len, int flags)
+{
+  libidle_entering_blocked_op();
+  ssize_t ret = next_recv(sockfd, buf, len, flags);
   libidle_left_blocked_op();
   return ret;
 }
