@@ -7,24 +7,23 @@ make
 make -C ../src libidle.so
 trap 'echo -e "\n# \e[41mTest failed.\e[0m"' ERR
 
-(
-  rm .libidle_state
-  LD_PRELOAD=${LD_PRELOAD:+${LD_PRELOAD}:}${IDLE_SO} ./accept &
-  trap "kill $!" EXIT
+function expect_locked() {
+  CMD="$1"
+  EXPECTED_STATE="$2"
+  rm .libidle_state || true
+  LD_PRELOAD=${LD_PRELOAD:+${LD_PRELOAD}:}${IDLE_SO} eval "$CMD &"
+  PROC=$!
+  trap "kill $PROC" RETURN
   sleep 0.5
   timeout 5 flock -x .libidle_state echo "Locked."
   # accept
-  test "$(cat .libidle_state)" == "1"
-)
+  test "$(cat .libidle_state)" == "$EXPECTED_STATE"
+}
 
-(
-  rm .libidle_state
-  LD_PRELOAD=${LD_PRELOAD:+${LD_PRELOAD}:}${IDLE_SO} ./receive &
-  trap "kill $!" EXIT
-  sleep 0.5
-  timeout 5 flock -x .libidle_state echo "Locked."
-  # accept (returns immediately), then recv
-  test "$(cat .libidle_state)" == "2"
-)
+# accept
+expect_locked './accept' '1'
+# accept (returns immediately), then recv
+expect_locked './receive' '2'
+expect_locked './sem_wait' '1'
 
 echo -e "\n# \e[30;42mTest successful.\e[0m"

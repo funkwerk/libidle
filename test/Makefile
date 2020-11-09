@@ -1,13 +1,12 @@
 CC ?= gcc
-CFLAGS += -g -Wall -Werror
+CFLAGS += -g -Wall -Werror -pthread
 
-default: accept receive
+TESTS=accept receive sem_wait
 
-accept: accept.c
-	$(CC) $(CFLAGS) -fPIC $^ -o $@
+default: ${TESTS}
 
-receive: receive.c
+${TESTS}: %: %.c
 	$(CC) $(CFLAGS) -fPIC $^ -o $@
 
 clean:
-	rm accept receive
+	rm ${TESTS} || true
