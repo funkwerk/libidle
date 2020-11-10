@@ -286,6 +286,8 @@ int sem_post(sem_t *sem)
     return ret;
 }
 
+static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *abs_timeout);
+
 /**
     * When we signal a semaphore, we don't know which sleeping semaphore will wake up.
     * Because of this, we must track additionally the number of *pending* wakeups.
@@ -293,6 +295,16 @@ int sem_post(sem_t *sem)
     * Conversely, sem_wait decrements.
     */
 int sem_wait(sem_t *sem)
+{
+    return libidle_sem_wait(false, sem, NULL);
+}
+
+int sem_timedwait(sem_t *sem, const struct timespec *abs_timeout)
+{
+    return libidle_sem_wait(true, sem, abs_timeout);
+}
+
+static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *abs_timeout)
 {
     NON_NULL(next_sem_wait);
 
@@ -307,7 +319,15 @@ int sem_wait(sem_t *sem)
 
     libidle_entering_blocked_op();
 
-    int ret = next_sem_wait(sem);
+    int ret;
+    if (timedwait)
+    {
+        ret = next_sem_timedwait(sem, abs_timeout);
+    }
+    else
+    {
+        ret = next_sem_wait(sem);
+    }
 
     /**
      * order matters here!
@@ -329,14 +349,5 @@ int sem_wait(sem_t *sem)
     }
     pthread_mutex_unlock(&mutex);
 
-    return ret;
-}
-
-int sem_timedwait(sem_t *sem, const struct timespec *abs_timeout)
-{
-    NON_NULL(next_sem_timedwait);
-    libidle_entering_blocked_op();
-    int ret = next_sem_timedwait(sem, abs_timeout);
-    libidle_left_blocked_op();
     return ret;
 }
