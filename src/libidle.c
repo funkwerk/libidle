@@ -137,7 +137,11 @@ void libidle_init()
     char *statefile = getenv("LIBIDLE_STATEFILE");
     if (!statefile) statefile = ".libidle_state";
 
-    pthread_mutex_init(&mutex, NULL);
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
 
     state.filedes = open(statefile, O_RDWR | O_CREAT | O_TRUNC, 0600);
     libidle_register_thread(pthread_self());
@@ -305,18 +309,25 @@ int sem_wait(sem_t *sem)
 
     int ret = next_sem_wait(sem);
 
+    /**
+     * order matters here!
+     * - unblock the op
+     * - unlink the semaphore
+     * - then decrement the wakeups.
+     * the point is that we must enter a known state of wakefulness before we
+     * untrack the semaphore. otherwise, libidle may miss the thread having woken.
+     */
     pthread_mutex_lock(&mutex);
-    if (sem_info)
-    {
-        sem_info->pending_wakeups--;
-    }
+    libidle_left_blocked_op();
     if (thr_info)
     {
         thr_info->waiting_semaphore = NULL;
     }
+    if (sem_info)
+    {
+        sem_info->pending_wakeups--;
+    }
     pthread_mutex_unlock(&mutex);
-
-    libidle_left_blocked_op();
 
     return ret;
 }
