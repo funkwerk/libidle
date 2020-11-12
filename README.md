@@ -9,6 +9,7 @@ has "come to rest": meaning, all threads are stuck in blocking system calls that
 
 - socket reads
 - sleep calls
+- waits on semaphores that haven't been posted in another thread
 - waits on condition variables that haven't been signalled in another thread
 
 When this state is reached, the test can safely proceed to the next stage.
@@ -18,7 +19,7 @@ When this state is reached, the test can safely proceed to the next stage.
 
 Preload the library when executing the process in question.
 ```
-IDLE_STATE=tmpfile LD_PRELOAD=libidle.so process
+LIBIDLE_STATEFILE=tmpfile LD_PRELOAD=libidle.so process
 ```
 The tmpfile will be created, if it doesn't exist.
 While the process is busy, libidle will keep an exclusive lock on this file. Simply
