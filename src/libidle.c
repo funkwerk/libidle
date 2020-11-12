@@ -353,11 +353,11 @@ int sem_post(sem_t *sem)
 static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *abs_timeout);
 
 /**
-    * When we signal a semaphore, we don't know which sleeping semaphore will wake up.
-    * Because of this, we must track additionally the number of *pending* wakeups.
-    * This is incremented in sem_post.
-    * Conversely, sem_wait decrements.
-    */
+ * When we signal a semaphore, we don't know which sleeping semaphore will wake up.
+ * Because of this, we must track additionally the number of *pending* wakeups.
+ * This is incremented in sem_post.
+ * Conversely, sem_wait decrements.
+ */
 int sem_wait(sem_t *sem)
 {
     return libidle_sem_wait(false, sem, NULL);
