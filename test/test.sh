@@ -13,7 +13,7 @@ function expect_locked() {
   rm .libidle_state || true
   LD_PRELOAD=${LD_PRELOAD:+${LD_PRELOAD}:}${IDLE_SO} eval "$CMD &"
   PROC=$!
-  trap "kill $PROC" EXIT RETURN
+  trap "kill $PROC" RETURN
   sleep 0.5
   flock --timeout 5 -x .libidle_state echo "Locked."
   # accept
@@ -25,16 +25,19 @@ function expect_not_locked() {
   rm .libidle_state || true
   LD_PRELOAD=${LD_PRELOAD:+${LD_PRELOAD}:}${IDLE_SO} eval "$CMD &"
   PROC=$!
-  trap "kill $PROC" EXIT RETURN
+  trap "kill $PROC" RETURN
   # shouldn't get a lock within 1s
   ! flock --timeout 1 -x .libidle_state echo "Locked."
 }
 
 # one call: accept
-expect_locked './accept' '1'
+expect_locked 'build/accept' '1'
 # accept (returns immediately), then recv
-expect_locked './receive' '2'
-expect_locked './sem_wait' '1'
-expect_not_locked './sem_post'
+expect_locked 'build/receive' '2'
+expect_locked 'build/sem_wait' '1'
+# this cluster of tests bounces a signal between two threads. the check is that we should not
+# go idle at any point during it.
+expect_not_locked 'build/sem_post'
+expect_not_locked 'build/pthread_cond_signal'
 
 echo -e "\n# \e[30;42mTest successful.\e[0m"
