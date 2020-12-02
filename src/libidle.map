@@ -1,0 +1,20 @@
+GLIBC_2.2.5 {
+  global:
+    pthread_cond_destroy;
+    pthread_cond_init;
+    pthread_cond_timedwait;
+    pthread_cond_wait;
+  local:
+    pthread_cond_destroy_*;
+    pthread_cond_init_*;
+    pthread_cond_timedwait_*;
+    pthread_cond_wait_*;
+};
+
+GLIBC_2.3.2 {
+  global:
+    pthread_cond_destroy;
+    pthread_cond_init;
+    pthread_cond_timedwait;
+    pthread_cond_wait;
+} GLIBC_2.2.5;

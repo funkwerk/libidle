@@ -26,6 +26,7 @@ function expect_not_locked() {
   LD_PRELOAD=${LD_PRELOAD:+${LD_PRELOAD}:}${IDLE_SO} eval "$CMD &"
   PROC=$!
   trap "kill $PROC" RETURN
+  sleep 0.5 # ensure the process has a lock on the file
   # shouldn't get a lock within 1s
   ! flock --timeout 1 -x .libidle_state echo "Locked."
 }
