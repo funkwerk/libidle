@@ -23,7 +23,6 @@ static int (*next_pthread_cond_init)(pthread_cond_t *restrict cond, const pthrea
 static int (*next_pthread_create)(pthread_t *thread, const pthread_attr_t *attr,
         void *(*start_routine)(void*), void *arg);
 static int (*next_pthread_join)(pthread_t thread, void **retval);
-static ssize_t (*next_recv)(int sockfd, void *buf, size_t len, int flags);
 static int (*next_sem_destroy)(sem_t *sem);
 static int (*next_sem_init)(sem_t *sem, int pshared, unsigned int value);
 static sem_t *(*next_sem_open)(const char *name, int oflag, ...);
@@ -227,7 +226,6 @@ void libidle_init()
     next_pthread_cond_init = dlvsym(RTLD_NEXT, "pthread_cond_init", "GLIBC_2.3.2");
     next_pthread_create = dlsym(RTLD_NEXT, "pthread_create");
     next_pthread_join = dlsym(RTLD_NEXT, "pthread_join");
-    next_recv = dlsym(RTLD_NEXT, "recv");
     next_sem_destroy = dlvsym(RTLD_NEXT, "sem_destroy", "GLIBC_2.2.5");
     next_sem_init = dlvsym(RTLD_NEXT, "sem_init", "GLIBC_2.2.5");
     next_sem_open = dlvsym(RTLD_NEXT, "sem_open", "GLIBC_2.2.5");
@@ -386,13 +384,13 @@ static void print_block_map()
             sem_info = libidle_find_sem_info(thr_info->waiting_semaphore);
         if (i) printf("|");
         printf(
-            thr_info->forced_idle ? "i" :
-            thr_info->forced_busy ? "A" :
-            (!thr_info->sleeping) ? "-" :
-            (!thr_info->waiting_semaphore) ? "b" :
-            !sem_info ? "?" :
-            (sem_info->pending_wakeups > 0) ? "S" :
-            "s");
+            thr_info->forced_idle ? "i" : // forced idle
+            thr_info->forced_busy ? "B" : // forced busy
+            (!thr_info->sleeping) ? "-" : // computing
+            (!thr_info->waiting_semaphore) ? "b" : // blocking busy
+            !sem_info ? "?" : // sleeping on an unknown semaphore
+            (sem_info->pending_wakeups > 0) ? "S" : // sleeping on a signaled semaphore
+            "s"); // sleeping on a semaphore
         // printf(threadinfo_is_blocked(thr_info) ? "x" : "-");
     }
     printf("\n");
@@ -448,15 +446,6 @@ int pthread_join(pthread_t thread, void **retval)
     entering_blocked_op();
     // TODO wakeup signalling on thread destruction
     int ret = next_pthread_join(thread, retval);
-    left_blocked_op();
-    return ret;
-}
-
-ssize_t recv(int sockfd, void *buf, size_t len, int flags)
-{
-    NON_NULL(next_recv);
-    entering_blocked_op();
-    ssize_t ret = next_recv(sockfd, buf, len, flags);
     left_blocked_op();
     return ret;
 }
