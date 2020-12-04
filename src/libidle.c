@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdarg.h>
@@ -84,6 +85,13 @@ typedef struct {
      * the idle counter until they've received and dispatched a full message.
      */
     bool forced_idle;
+    /**
+     * Forces the thread to remain marked as busy even if it is blocked.
+     * This is so that things like HTTP clients can remain busy while
+     * receiving a response. This is because waiting for a response to an
+     * internally triggered request is not a source of idleness.
+     */
+    bool forced_busy;
     // non-null when waiting on a semaphore, requires sleeping=true
     sem_t *waiting_semaphore;
 } ThreadInfo;
@@ -158,6 +166,10 @@ static bool threadinfo_is_blocked(ThreadInfo *thr_info)
     {
         return true;
     }
+    if (thr_info->forced_busy)
+    {
+        return false;
+    }
     if (!thr_info->sleeping)
     {
         return false;
@@ -167,7 +179,7 @@ static bool threadinfo_is_blocked(ThreadInfo *thr_info)
         return true;
     }
     SemaphoreInfo *sem_info = libidle_find_sem_info(thr_info->waiting_semaphore);
-    return sem_info->pending_wakeups > 0 ? false : true;
+    return sem_info && sem_info->pending_wakeups > 0 ? false : true;
 }
 
 // called when we've gone busy
@@ -193,13 +205,16 @@ static void libidle_unlock()
 
 static void libidle_register_thread(pthread_t thread)
 {
+    pthread_mutex_lock(&state.mutex);
     state.thr_info_ptr = realloc(state.thr_info_ptr, sizeof(ThreadInfo) * ++state.thr_info_len);
     state.thr_info_ptr[state.thr_info_len - 1] = (ThreadInfo) {
         .id = thread,
         .sleeping = false,
         .forced_idle = false,
+        .forced_busy = false,
         .waiting_semaphore = NULL,
     };
+    pthread_mutex_unlock(&state.mutex);
 }
 
 __attribute__ ((constructor))
@@ -211,12 +226,12 @@ void libidle_init()
     next_pthread_create = dlsym(RTLD_NEXT, "pthread_create");
     next_pthread_join = dlsym(RTLD_NEXT, "pthread_join");
     next_recv = dlsym(RTLD_NEXT, "recv");
-    next_sem_destroy = dlsym(RTLD_NEXT, "sem_destroy");
-    next_sem_init = dlsym(RTLD_NEXT, "sem_init");
-    next_sem_open = dlsym(RTLD_NEXT, "sem_open");
-    next_sem_post = dlsym(RTLD_NEXT, "sem_post");
-    next_sem_timedwait = dlsym(RTLD_NEXT, "sem_timedwait");
-    next_sem_wait = dlsym(RTLD_NEXT, "sem_wait");
+    next_sem_destroy = dlvsym(RTLD_NEXT, "sem_destroy", "GLIBC_2.2.5");
+    next_sem_init = dlvsym(RTLD_NEXT, "sem_init", "GLIBC_2.2.5");
+    next_sem_open = dlvsym(RTLD_NEXT, "sem_open", "GLIBC_2.2.5");
+    next_sem_post = dlvsym(RTLD_NEXT, "sem_post", "GLIBC_2.2.5");
+    next_sem_timedwait = dlvsym(RTLD_NEXT, "sem_timedwait", "GLIBC_2.2.5");
+    next_sem_wait = dlvsym(RTLD_NEXT, "sem_wait", "GLIBC_2.2.5");
 
     char *statefile = getenv("LIBIDLE_STATEFILE");
     if (!statefile) statefile = ".libidle_state";
@@ -228,7 +243,7 @@ void libidle_init()
     pthread_mutexattr_destroy(&attr);
 
     state.filedes = open(statefile, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    state.verbose = getenv("LIBIDLE_VERBOSE") ? 1 : 0;
+    state.verbose = getenv("LIBIDLE_VERBOSE") ? true : false;
     libidle_register_thread(pthread_self());
     libidle_lock();
 }
@@ -277,6 +292,28 @@ void libidle_disable_forced_idle()
     assert(thr_info);
     thr_info->forced_idle = false;
     maybe_lock();
+
+    pthread_mutex_unlock(&state.mutex);
+}
+
+void libidle_enable_forced_busy()
+{
+    pthread_mutex_lock(&state.mutex);
+
+    ThreadInfo *thr_info = find_thread_info();
+    assert(thr_info);
+    thr_info->forced_busy = true;
+
+    pthread_mutex_unlock(&state.mutex);
+}
+
+void libidle_disable_forced_busy()
+{
+    pthread_mutex_lock(&state.mutex);
+
+    ThreadInfo *thr_info = find_thread_info();
+    assert(thr_info);
+    thr_info->forced_busy = false;
 
     pthread_mutex_unlock(&state.mutex);
 }
@@ -342,8 +379,19 @@ static void print_block_map()
     {
         ThreadInfo *thr_info = &state.thr_info_ptr[i];
 
+        SemaphoreInfo *sem_info;
+        if (thr_info->waiting_semaphore)
+            sem_info = libidle_find_sem_info(thr_info->waiting_semaphore);
         if (i) printf("|");
-        printf(threadinfo_is_blocked(thr_info) ? "x" : "-");
+        printf(
+            thr_info->forced_idle ? "i" :
+            thr_info->forced_busy ? "A" :
+            (!thr_info->sleeping) ? "-" :
+            (!thr_info->waiting_semaphore) ? "b" :
+            !sem_info ? "?" :
+            (sem_info->pending_wakeups > 0) ? "S" :
+            "s");
+        // printf(threadinfo_is_blocked(thr_info) ? "x" : "-");
     }
     printf("\n");
 }
@@ -433,7 +481,7 @@ sem_t *sem_open(const char *name, int oflag, ...)
     return 0;
 }
 
-int sem_init(sem_t *sem, int pshared, unsigned int value)
+int sem_init_225(sem_t *sem, int pshared, unsigned int value)
 {
     NON_NULL(next_sem_init);
 
@@ -459,7 +507,7 @@ int sem_init(sem_t *sem, int pshared, unsigned int value)
     return 0;
 }
 
-int sem_destroy(sem_t *sem)
+int sem_destroy_225(sem_t *sem)
 {
     NON_NULL(next_sem_destroy);
 
@@ -484,7 +532,7 @@ int sem_destroy(sem_t *sem)
     return next_sem_destroy(sem);
 }
 
-int sem_post(sem_t *sem)
+int sem_post_225(sem_t *sem)
 {
     NON_NULL(next_sem_post);
 
@@ -508,12 +556,12 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
  * This is incremented in sem_post.
  * Conversely, sem_wait decrements.
  */
-int sem_wait(sem_t *sem)
+int sem_wait_225(sem_t *sem)
 {
     return libidle_sem_wait(false, sem, NULL);
 }
 
-int sem_timedwait(sem_t *sem, const struct timespec *abs_timeout)
+int sem_timedwait_225(sem_t *sem, const struct timespec *abs_timeout)
 {
     return libidle_sem_wait(true, sem, abs_timeout);
 }
@@ -526,19 +574,20 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     pthread_mutex_lock(&state.mutex);
 
     SemaphoreInfo *sem_info = libidle_find_sem_info(sem);
+    bool is_named_semaphore = sem_info->named_semaphore;
     assert(sem_info);
 
     ThreadInfo *thr_info = libidle_find_thr_info(pthread_self());
     assert(thr_info);
 
-    if (!sem_info->named_semaphore)
+    if (!is_named_semaphore)
     {
         thr_info->waiting_semaphore = sem;
     }
 
     pthread_mutex_unlock(&state.mutex);
 
-    if (!sem_info->named_semaphore)
+    if (!is_named_semaphore)
     {
         entering_blocked_op();
     }
@@ -561,11 +610,15 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
      * the point is that we must enter a known state of wakefulness before we
      * untrack the semaphore. otherwise, libidle may miss the thread having woken.
      */
-    if (!sem_info->named_semaphore)
+    if (!is_named_semaphore)
     {
         pthread_mutex_lock(&state.mutex);
 
         left_blocked_op();
+
+        // refind due to realloc
+        thr_info = libidle_find_thr_info(pthread_self());
+        sem_info = libidle_find_sem_info(sem);
 
         thr_info->waiting_semaphore = NULL;
         sem_info->pending_wakeups--;
@@ -592,8 +645,8 @@ int pthread_cond_init_232(pthread_cond_t *restrict cond, const pthread_condattr_
         .sleeping_threads = 0,
     };
     // our own function - not next_!
-    sem_init(info->in, 0, 0);
-    sem_init(info->out, 0, 0);
+    sem_init_225(info->in, 0, 0);
+    sem_init_225(info->out, 0, 0);
 
     pthread_mutex_unlock(&state.mutex);
 
@@ -606,7 +659,7 @@ int pthread_cond_destroy_232(pthread_cond_t *cond)
 
     pthread_mutex_lock(&state.mutex);
 
-    // TODO iterate backwards- faster? more recently created sems are likely to be at the back
+    // TODO iterate backwards- faster? more recently created condvars are likely to be at the back
     for (int i = 0; i < state.cond_info_len; i++)
     {
         ConditionInfo *cond_info = &state.cond_info_ptr[i];
@@ -615,8 +668,8 @@ int pthread_cond_destroy_232(pthread_cond_t *cond)
             // pthread_cond_destroy undefined if we're still waiting on this condition
             assert(cond_info->sleeping_threads == 0);
 
-            sem_destroy(cond_info->in);
-            sem_destroy(cond_info->out);
+            sem_destroy_225(cond_info->in);
+            sem_destroy_225(cond_info->out);
             free(cond_info->in);
             free(cond_info->out);
 
@@ -633,7 +686,8 @@ int pthread_cond_destroy_232(pthread_cond_t *cond)
     return next_pthread_cond_destroy(cond);
 }
 
-int pthread_cond_wait_232(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex)
+int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex,
+    const struct timespec *restrict abstime)
 {
     pthread_mutex_lock(&state.mutex);
 
@@ -651,9 +705,26 @@ int pthread_cond_wait_232(pthread_cond_t *restrict cond, pthread_mutex_t *restri
 
     pthread_mutex_unlock(&state.mutex); // all state modifications are done.
 
-    sem_wait(in);
+    if (abstime)
+    {
+        int ret = sem_timedwait_225(in, abstime);
+        // TODO I am *pretty* sure this part has issues.
+        if (ret == ETIMEDOUT)
+        {
+            pthread_mutex_lock(mutex);
+            pthread_mutex_lock(&state.mutex);
+            cond_info = libidle_find_cond_info(cond);
+            cond_info->sleeping_threads--;
+            pthread_mutex_unlock(&state.mutex);
+            return ETIMEDOUT;
+        }
+    }
+    else
+    {
+        sem_wait_225(in);
+    }
     // printf("cond waiter woke up.\n");
-    sem_post(out);
+    sem_post_225(out);
 
     // grab the mutex back
     pthread_mutex_lock(mutex);
@@ -661,20 +732,12 @@ int pthread_cond_wait_232(pthread_cond_t *restrict cond, pthread_mutex_t *restri
     return 0;
 }
 
-int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex,
-        const struct timespec *restrict abstime)
+int pthread_cond_wait_232(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex)
 {
-    // TODO sem_timedwait
-    return pthread_cond_wait_232(cond, mutex);
+    return pthread_cond_timedwait_232(cond, mutex, NULL);
 }
 
-int pthread_cond_signal(pthread_cond_t *cond)
-{
-    // allowed under condition semantics!
-    return pthread_cond_broadcast(cond);
-}
-
-int pthread_cond_broadcast(pthread_cond_t *cond)
+int pthread_cond_broadcast_232(pthread_cond_t *cond)
 {
     pthread_mutex_lock(&state.mutex);
 
@@ -691,8 +754,8 @@ int pthread_cond_broadcast(pthread_cond_t *cond)
     // reinit cond_info - create a new "cond_wait/cond_signal group".
     cond_info->in = malloc(sizeof(sem_t));
     cond_info->out = malloc(sizeof(sem_t));
-    sem_init(cond_info->in, 0, 0);
-    sem_init(cond_info->out, 0, 0);
+    sem_init_225(cond_info->in, 0, 0);
+    sem_init_225(cond_info->out, 0, 0);
     cond_info->sleeping_threads = 0;
 
     pthread_mutex_unlock(&state.mutex); // done with state mutation
@@ -701,27 +764,40 @@ int pthread_cond_broadcast(pthread_cond_t *cond)
     for (int i = 0; i < were_sleeping; i++)
     {
         // printf("post sem %p\n", in);
-        sem_post(in);
+        sem_post_225(in);
     }
 
     // printf("> collect tokens\n");
     for (int i = 0; i < were_sleeping; i++)
     {
-        sem_wait(out);
+        sem_wait_225(out);
     }
     // printf("> tokens collected\n");
     // because we've waited for out, we can now clean up the semaphores.
-    sem_destroy(in);
-    sem_destroy(out);
+    sem_destroy_225(in);
+    sem_destroy_225(out);
     free(in);
     free(out);
 
     return 0;
 }
 
+int pthread_cond_signal_232(pthread_cond_t *cond)
+{
+    // allowed under condition semantics!
+    return pthread_cond_broadcast_232(cond);
+}
+
 // see http://blog.fesnel.com/blog/2009/08/25/preloading-with-multiple-symbol-versions/
 // see https://code.woboq.org/userspace/glibc/nptl/pthread_cond_init.c.html
+__asm__(".symver pthread_cond_broadcast_232, pthread_cond_broadcast@@GLIBC_2.3.2");
 __asm__(".symver pthread_cond_destroy_232, pthread_cond_destroy@@GLIBC_2.3.2");
 __asm__(".symver pthread_cond_init_232, pthread_cond_init@@GLIBC_2.3.2");
 __asm__(".symver pthread_cond_timedwait_232, pthread_cond_timedwait@@GLIBC_2.3.2");
 __asm__(".symver pthread_cond_wait_232, pthread_cond_wait@@GLIBC_2.3.2");
+__asm__(".symver pthread_cond_signal_232, pthread_cond_signal@@GLIBC_2.3.2");
+__asm__(".symver sem_destroy_225, sem_destroy@@GLIBC_2.2.5");
+__asm__(".symver sem_init_225, sem_init@@GLIBC_2.2.5");
+__asm__(".symver sem_post_225, sem_post@@GLIBC_2.2.5");
+__asm__(".symver sem_wait_225, sem_wait@@GLIBC_2.2.5");
+__asm__(".symver sem_timedwait_225, sem_timedwait@@GLIBC_2.2.5");
