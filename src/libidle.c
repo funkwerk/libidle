@@ -796,8 +796,10 @@ int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *r
             {
                 // printf("? ? ? already signaled\n");
                 // consume our semaphore (will always succeed)
-                // this situation happens if the semaphore triggered after the timeout
-                // in that case, it will not see our reduction in sleeping_threads.
+                // this situation happens if the condition was signaled after the timeout,
+                // but before we got the lock - for instance, if it timed out while _broadcast held the lock.
+                // In that case, _broadcast will not see our reduction in sleeping_threads,
+                // so we must wait and post for it.
                 sem_wait_225(in);
                 sem_post_225(out);
             }
