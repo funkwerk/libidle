@@ -74,7 +74,11 @@ typedef struct {
  */
 typedef struct {
     pthread_cond_t *cond;
-    sem_t *in, *out; // malloced because it needs to be stable across reallocs
+    // TODO one struct for all three (ConditionEventInfo?)
+    // malloced because it needs to be stable across reallocs
+    sem_t *in, *out;
+    // set to true once the thread has been signaled, to allow us to collect and post late
+    bool *signaled;
     int sleeping_threads;
 } ConditionInfo;
 
@@ -713,11 +717,13 @@ int pthread_cond_init_232(pthread_cond_t *restrict cond, const pthread_condattr_
         .cond = cond,
         .in = malloc(sizeof(sem_t)),
         .out = malloc(sizeof(sem_t)),
+        .signaled = malloc(sizeof(bool)),
         .sleeping_threads = 0,
     };
     // our own function - not next_!
     sem_init_225(info->in, 0, 0);
     sem_init_225(info->out, 0, 0);
+    *info->signaled = false;
 
     pthread_mutex_unlock(&state.mutex);
 
@@ -743,6 +749,7 @@ int pthread_cond_destroy_232(pthread_cond_t *cond)
             sem_destroy_225(cond_info->out);
             free(cond_info->in);
             free(cond_info->out);
+            free(cond_info->signaled);
 
             // swap with last entry and shrink
             *cond_info = state.cond_info_ptr[state.cond_info_len - 1];
@@ -773,28 +780,46 @@ int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *r
 
     cond_info->sleeping_threads++;
     sem_t *in = cond_info->in, *out = cond_info->out;
+    bool *signaled = cond_info->signaled;
 
     pthread_mutex_unlock(&state.mutex); // all state modifications are done.
 
+    int ret;
     if (abstime)
     {
-        int ret = sem_timedwait_225(in, abstime);
-        // TODO I am *pretty* sure this part has issues.
+        ret = sem_timedwait_225(in, abstime);
         if (ret == -1 && errno == ETIMEDOUT)
         {
-            pthread_mutex_lock(mutex);
+            // printf("! ! ! timeout case\n");
             pthread_mutex_lock(&state.mutex);
-            cond_info = libidle_find_cond_info(cond);
-            cond_info->sleeping_threads--;
+            if (*signaled)
+            {
+                // printf("? ? ? already signaled\n");
+                // consume our semaphore (will always succeed)
+                // this situation happens if the semaphore triggered after the timeout
+                // in that case, it will not see our reduction in sleeping_threads.
+                sem_wait_225(in);
+                sem_post_225(out);
+            }
+            else
+            {
+                // refind cause array may have realloced
+                cond_info = libidle_find_cond_info(cond);
+                cond_info->sleeping_threads--;
+            }
             pthread_mutex_unlock(&state.mutex);
+
+            pthread_mutex_lock(mutex);
+
             // pthread_cond_timedwait reports errors differently from sem_timedwait
             return ETIMEDOUT;
         }
     }
     else
     {
-        sem_wait_225(in);
+        ret = sem_wait_225(in);
     }
+    assert(ret == 0);
     // printf("cond waiter woke up.\n");
     sem_post_225(out);
 
@@ -820,17 +845,18 @@ int pthread_cond_broadcast_232(pthread_cond_t *cond)
     assert(cond_info);
 
     sem_t *in = cond_info->in, *out = cond_info->out;
+    bool *signaled = cond_info->signaled;
     int were_sleeping = cond_info->sleeping_threads;
     // printf("> broadcast to %i (%p)\n", were_sleeping, cond);
 
     // reinit cond_info - create a new "cond_wait/cond_signal group".
     cond_info->in = malloc(sizeof(sem_t));
     cond_info->out = malloc(sizeof(sem_t));
+    cond_info->signaled = malloc(sizeof(bool));
     sem_init_225(cond_info->in, 0, 0);
     sem_init_225(cond_info->out, 0, 0);
+    *cond_info->signaled = false;
     cond_info->sleeping_threads = 0;
-
-    pthread_mutex_unlock(&state.mutex); // done with state mutation
 
     // printf("> distribute tokens\n");
     for (int i = 0; i < were_sleeping; i++)
@@ -838,6 +864,8 @@ int pthread_cond_broadcast_232(pthread_cond_t *cond)
         // printf("post sem %p\n", in);
         sem_post_225(in);
     }
+    *signaled = true;
+    pthread_mutex_unlock(&state.mutex); // done with state mutation
 
     // printf("> collect tokens\n");
     for (int i = 0; i < were_sleeping; i++)
@@ -850,6 +878,7 @@ int pthread_cond_broadcast_232(pthread_cond_t *cond)
     sem_destroy_225(out);
     free(in);
     free(out);
+    free(signaled);
 
     return 0;
 }
