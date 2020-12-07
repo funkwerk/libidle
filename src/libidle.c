@@ -3,12 +3,14 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <execinfo.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -328,6 +330,10 @@ void libidle_enable_forced_busy()
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
     thr_info->forced_busy = true;
+    /*printf("enable forced busy\n");
+    void *buffer[16];
+    backtrace(buffer, 16);
+    backtrace_symbols_fd(buffer, 16, 1);*/
 
     pthread_mutex_unlock(&state.mutex);
 }
@@ -763,7 +769,7 @@ int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *r
     ConditionInfo *cond_info = libidle_find_cond_info(cond);
     // assert(cond_info);
 
-    // printf("> sleep on %p: sem %p\n", cond, cond_info->in);
+    // printf("> sleep on %p: sem %p, %i\n", cond, cond_info->in, !!abstime);
 
     cond_info->sleeping_threads++;
     sem_t *in = cond_info->in, *out = cond_info->out;
@@ -774,13 +780,14 @@ int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *r
     {
         int ret = sem_timedwait_225(in, abstime);
         // TODO I am *pretty* sure this part has issues.
-        if (ret == ETIMEDOUT)
+        if (ret == -1 && errno == ETIMEDOUT)
         {
             pthread_mutex_lock(mutex);
             pthread_mutex_lock(&state.mutex);
             cond_info = libidle_find_cond_info(cond);
             cond_info->sleeping_threads--;
             pthread_mutex_unlock(&state.mutex);
+            // pthread_cond_timedwait reports errors differently from sem_timedwait
             return ETIMEDOUT;
         }
     }
