@@ -1,7 +1,7 @@
 CC ?= gcc
 CFLAGS += -g -Wall -Werror -pthread
 
-TESTS=accept nanosleep receive sem_wait sem_post pthread_cond_signal
+TESTS=accept nanosleep sem_wait sem_post pthread_cond_signal
 
 default: ${TESTS}
 

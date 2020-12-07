@@ -80,23 +80,26 @@ typedef struct {
     pthread_t id;
     bool sleeping;
     /**
+     * Forces the thread to remain marked as busy even if it is blocked.
+     * This is so that things like HTTP clients can remain busy while
+     * receiving a response. This is because waiting for a response to an
+     * internally triggered request is not a source of idleness.
+     * Has priority over forced_idle.
+     */
+    bool forced_busy;
+    /**
      * Forces the thread to remain marked as idle even if it is "awake".
      * This is so that things like message receive loops can avoid incrementing
      * the idle counter until they've received and dispatched a full message.
      */
     bool forced_idle;
-    /**
-     * Forces the thread to remain marked as busy even if it is blocked.
-     * This is so that things like HTTP clients can remain busy while
-     * receiving a response. This is because waiting for a response to an
-     * internally triggered request is not a source of idleness.
-     */
-    bool forced_busy;
     // non-null when waiting on a semaphore, requires sleeping=true
     sem_t *waiting_semaphore;
 } ThreadInfo;
 
 static struct {
+    bool initialized;
+
     // locks access to state
     pthread_mutex_t mutex;
 
@@ -162,13 +165,13 @@ static ThreadInfo *libidle_find_thr_info(pthread_t id)
  */
 static bool threadinfo_is_blocked(ThreadInfo *thr_info)
 {
-    if (thr_info->forced_idle)
-    {
-        return true;
-    }
     if (thr_info->forced_busy)
     {
         return false;
+    }
+    if (thr_info->forced_idle)
+    {
+        return true;
     }
     if (!thr_info->sleeping)
     {
@@ -210,16 +213,35 @@ static void libidle_register_thread(pthread_t thread)
     state.thr_info_ptr[state.thr_info_len - 1] = (ThreadInfo) {
         .id = thread,
         .sleeping = false,
-        .forced_idle = false,
         .forced_busy = false,
+        .forced_idle = false,
         .waiting_semaphore = NULL,
     };
+    pthread_mutex_unlock(&state.mutex);
+}
+
+static void libidle_unregister_thread(pthread_t thread)
+{
+    pthread_mutex_lock(&state.mutex);
+    for (int i = 0; i < state.thr_info_len; i++)
+    {
+        ThreadInfo *thr_info = &state.thr_info_ptr[i];
+        if (thr_info->id == thread)
+        {
+            // swap with last entry and shrink
+            *thr_info = state.thr_info_ptr[state.thr_info_len - 1];
+            state.thr_info_ptr = realloc(state.thr_info_ptr, sizeof(ThreadInfo) * --state.thr_info_len);
+            break;
+        }
+    }
     pthread_mutex_unlock(&state.mutex);
 }
 
 __attribute__ ((constructor))
 void libidle_init()
 {
+    if (state.initialized) return;
+
     next_accept = dlsym(RTLD_NEXT, "accept");
     next_nanosleep = dlsym(RTLD_NEXT, "nanosleep");
     next_pthread_cond_destroy = dlvsym(RTLD_NEXT, "pthread_cond_destroy", "GLIBC_2.3.2");
@@ -228,7 +250,7 @@ void libidle_init()
     next_pthread_join = dlsym(RTLD_NEXT, "pthread_join");
     next_sem_destroy = dlvsym(RTLD_NEXT, "sem_destroy", "GLIBC_2.2.5");
     next_sem_init = dlvsym(RTLD_NEXT, "sem_init", "GLIBC_2.2.5");
-    next_sem_open = dlvsym(RTLD_NEXT, "sem_open", "GLIBC_2.2.5");
+    next_sem_open = dlsym(RTLD_NEXT, "sem_open");
     next_sem_post = dlvsym(RTLD_NEXT, "sem_post", "GLIBC_2.2.5");
     next_sem_timedwait = dlvsym(RTLD_NEXT, "sem_timedwait", "GLIBC_2.2.5");
     next_sem_wait = dlvsym(RTLD_NEXT, "sem_wait", "GLIBC_2.2.5");
@@ -246,6 +268,7 @@ void libidle_init()
     state.verbose = getenv("LIBIDLE_VERBOSE") ? true : false;
     libidle_register_thread(pthread_self());
     libidle_lock();
+    state.initialized = true;
 }
 
 static void entering_blocked_op()
@@ -254,7 +277,8 @@ static void entering_blocked_op()
 
     ThreadInfo *thr_info = find_thread_info();
     if (thr_info) thr_info->sleeping = true;
-    maybe_unlock();
+    if (!thr_info || !thr_info->forced_idle)
+        maybe_unlock();
 
     pthread_mutex_unlock(&state.mutex);
 }
@@ -265,7 +289,8 @@ static void left_blocked_op()
 
     ThreadInfo *thr_info = find_thread_info();
     if (thr_info) thr_info->sleeping = false;
-    maybe_lock();
+    if (!thr_info || !thr_info->forced_idle)
+        maybe_lock();
 
     pthread_mutex_unlock(&state.mutex);
 }
@@ -384,8 +409,8 @@ static void print_block_map()
             sem_info = libidle_find_sem_info(thr_info->waiting_semaphore);
         if (i) printf("|");
         printf(
-            thr_info->forced_idle ? "i" : // forced idle
             thr_info->forced_busy ? "B" : // forced busy
+            thr_info->forced_idle ? "i" : // forced idle
             (!thr_info->sleeping) ? "-" : // computing
             (!thr_info->waiting_semaphore) ? "b" : // blocking busy
             !sem_info ? "?" : // sleeping on an unknown semaphore
@@ -428,11 +453,48 @@ int nanosleep(const struct timespec *req, struct timespec *rem)
     return ret;
 }
 
+/**
+ * pthread_create
+ */
+
+void remove_thread_info()
+{
+    libidle_unregister_thread(pthread_self());
+}
+
+struct ActualThreadInfo
+{
+    void *(*start_routine)(void*);
+    void *arg;
+};
+
+void *thread_wrapper(void *arg)
+{
+    struct ActualThreadInfo actual_thread_info = *(struct ActualThreadInfo*) arg;
+
+    free(arg);
+
+    void *ret; // pthread_cleanup_push and _pop are actually macros with unbalanced braces
+
+    pthread_cleanup_push(&remove_thread_info, NULL);
+    ret = actual_thread_info.start_routine(actual_thread_info.arg);
+    pthread_cleanup_pop(true);
+    return ret;
+}
+
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         void *(*start_routine) (void *), void *arg)
 {
     NON_NULL(next_pthread_create);
-    int ret = next_pthread_create(thread, attr, start_routine, arg);
+
+    struct ActualThreadInfo *actual_thread_info = malloc(sizeof(struct ActualThreadInfo));
+
+    *actual_thread_info = (struct ActualThreadInfo) {
+        .start_routine = start_routine,
+        .arg = arg,
+    };
+
+    int ret = next_pthread_create(thread, attr, thread_wrapper, actual_thread_info);
     if (ret == 0)
     {
         libidle_register_thread(*thread);
@@ -452,6 +514,9 @@ int pthread_join(pthread_t thread, void **retval)
 
 sem_t *sem_open(const char *name, int oflag, ...)
 {
+    // we may be called very early by libfaketime
+    libidle_init();
+
     NON_NULL(next_sem_open);
 
     sem_t *ret;
