@@ -668,14 +668,20 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     }
 
     int ret;
-    if (timedwait)
+
+    // EINTR == interrupted by a system call, just retry with the same parameters
+    do
     {
-        ret = next_sem_timedwait(sem, abs_timeout);
+      if (timedwait)
+      {
+          ret = next_sem_timedwait(sem, abs_timeout);
+      }
+      else
+      {
+          ret = next_sem_wait(sem);
+      }
     }
-    else
-    {
-        ret = next_sem_wait(sem);
-    }
+    while (ret == -1 && errno == EINTR);
 
     /**
      * order matters here!
