@@ -63,6 +63,11 @@ request has been received.
 - While requesting an external resource from a mock service, set the requesting thread to forced busy
 to indicate you are expecting a response before the test may proceed.
 
+At any given time, the *outermost* pair of forced-idle/forced-busy calls will be in effect!
+This is because the outmost code is usually the code that knows its intentions the best.
+
+Keep in mind that **any enable call must be paired with a matching disable call, in stack order**.
+
 ## Details
 ### Implementing Condition Variables with Semaphores
 
@@ -78,11 +83,11 @@ as said, `wait` and `timedwait` can choose to wake up at any time anyway.
 `pthread_cond_wait` and `pthread_cond_broadcast` interact in a "condition frame" attached to each condition,
 consisting of two semaphores, `in` and `out`. When a condition is signalled, it immediately creates a new condition
 frame, ensuring that future waits will only be woken by future signals. It then considers the number
-of waiting threads and posts 'n' semaphore tokens on `in`, then acquires 'n' tokens on `out`.
+of waiting threads and posts _n_ semaphore tokens on `in`, then acquires _n_ tokens on `out`.
 
 Each waiting thread similarly acquires a token on `in` (implementing the actual waiting), then posts a token on `out`.
 
-After 'n' tokens have been acquired by the broadcasting thread, it knows that the condition frame is completed.
+After _n_ tokens have been acquired by the broadcasting thread, it knows that the condition frame is completed.
 At this stage, it destroys and frees the associated semaphores.
 
 Some care is required with timeouts. When a waiting thread times out, it must decrement the number of waiting threads.

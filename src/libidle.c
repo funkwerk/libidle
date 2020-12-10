@@ -18,6 +18,16 @@
 
 #define NON_NULL(S) do { if (!S) { fprintf(stderr, "couldn't load symbol: " #S "\n"); abort(); } } while (false)
 
+/**
+ * Arrays consist of name_ptr and name_len.
+ * Increase the length of this array by 1 and yield the new value.
+ */
+#define PUSH(array) array ## _ptr = realloc(array ## _ptr, sizeof(*array ## _ptr) * ++array ## _len);\
+    array ## _ptr[array ## _len - 1]
+
+/// Decrease the length of this array by 1.
+#define DROP(array) array ## _ptr = realloc(array ## _ptr, sizeof(*array ## _ptr) * --array ## _len);
+
 static int (*next_accept)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 static int (*next_nanosleep)(const struct timespec *req, struct timespec *rem);
 static int (*next_pthread_cond_destroy)(pthread_cond_t *cond);
@@ -82,23 +92,34 @@ typedef struct {
     int sleeping_threads;
 } ConditionInfo;
 
+/**
+ * Because we want to support composition, the outermost override "counts".
+ * Hence, instead of flags, we use a stack of `enum ForcedState`.
+ */
+enum ForcedState {
+    /**
+    * Forces the thread to remain marked as busy even if it is blocked.
+    * This is so that things like HTTP clients can remain busy while
+    * receiving a response. This is because waiting for a response to an
+    * internally triggered request is not a source of idleness.
+    * Has priority over forced_idle.
+    */
+    BUSY,
+    /**
+      * Forces the thread to remain marked as idle even if it is "awake".
+      * This is so that things like message receive loops can avoid incrementing
+      * the idle counter until they've received and dispatched a full message.
+      */
+    IDLE,
+};
+
 typedef struct {
     pthread_t id;
     bool sleeping;
-    /**
-     * Forces the thread to remain marked as busy even if it is blocked.
-     * This is so that things like HTTP clients can remain busy while
-     * receiving a response. This is because waiting for a response to an
-     * internally triggered request is not a source of idleness.
-     * Has priority over forced_idle.
-     */
-    bool forced_busy;
-    /**
-     * Forces the thread to remain marked as idle even if it is "awake".
-     * This is so that things like message receive loops can avoid incrementing
-     * the idle counter until they've received and dispatched a full message.
-     */
-    bool forced_idle;
+
+    size_t forced_state_len;
+    enum ForcedState *forced_state_ptr;
+
     // non-null when waiting on a semaphore, requires sleeping=true
     sem_t *waiting_semaphore;
 } ThreadInfo;
@@ -171,11 +192,11 @@ static ThreadInfo *libidle_find_thr_info(pthread_t id)
  */
 static bool threadinfo_is_blocked(ThreadInfo *thr_info)
 {
-    if (thr_info->forced_busy)
+    if (thr_info->forced_state_len > 0 && thr_info->forced_state_ptr[0] == BUSY)
     {
         return false;
     }
-    if (thr_info->forced_idle)
+    if (thr_info->forced_state_len > 0 && thr_info->forced_state_ptr[0] == IDLE)
     {
         return true;
     }
@@ -215,12 +236,11 @@ static void libidle_unlock()
 static void libidle_register_thread(pthread_t thread)
 {
     pthread_mutex_lock(&state.mutex);
-    state.thr_info_ptr = realloc(state.thr_info_ptr, sizeof(ThreadInfo) * ++state.thr_info_len);
-    state.thr_info_ptr[state.thr_info_len - 1] = (ThreadInfo) {
+    PUSH(state.thr_info) = (ThreadInfo) {
         .id = thread,
         .sleeping = false,
-        .forced_busy = false,
-        .forced_idle = false,
+        .forced_state_ptr = NULL,
+        .forced_state_len = 0,
         .waiting_semaphore = NULL,
     };
     pthread_mutex_unlock(&state.mutex);
@@ -236,7 +256,7 @@ static void libidle_unregister_thread(pthread_t thread)
         {
             // swap with last entry and shrink
             *thr_info = state.thr_info_ptr[state.thr_info_len - 1];
-            state.thr_info_ptr = realloc(state.thr_info_ptr, sizeof(ThreadInfo) * --state.thr_info_len);
+            DROP(state.thr_info);
             break;
         }
     }
@@ -283,7 +303,7 @@ static void entering_blocked_op()
 
     ThreadInfo *thr_info = find_thread_info();
     if (thr_info) thr_info->sleeping = true;
-    if (!thr_info || !thr_info->forced_idle)
+    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE)
         maybe_unlock();
 
     pthread_mutex_unlock(&state.mutex);
@@ -295,7 +315,7 @@ static void left_blocked_op()
 
     ThreadInfo *thr_info = find_thread_info();
     if (thr_info) thr_info->sleeping = false;
-    if (!thr_info || !thr_info->forced_idle)
+    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE)
         maybe_lock();
 
     pthread_mutex_unlock(&state.mutex);
@@ -308,7 +328,9 @@ void libidle_enable_forced_idle()
 
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
-    thr_info->forced_idle = true;
+
+    PUSH(thr_info->forced_state) = IDLE;
+
     maybe_unlock();
 
     pthread_mutex_unlock(&state.mutex);
@@ -321,7 +343,10 @@ void libidle_disable_forced_idle()
 
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
-    thr_info->forced_idle = false;
+
+    assert(thr_info->forced_state_len > 0 && thr_info->forced_state_ptr[thr_info->forced_state_len - 1] == IDLE);
+    DROP(thr_info->forced_state);
+
     maybe_lock();
 
     pthread_mutex_unlock(&state.mutex);
@@ -333,7 +358,9 @@ void libidle_enable_forced_busy()
 
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
-    thr_info->forced_busy = true;
+
+    PUSH(thr_info->forced_state) = BUSY;
+
     /*printf("enable forced busy\n");
     void *buffer[16];
     backtrace(buffer, 16);
@@ -348,7 +375,9 @@ void libidle_disable_forced_busy()
 
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
-    thr_info->forced_busy = false;
+
+    assert(thr_info->forced_state_len > 0 && thr_info->forced_state_ptr[thr_info->forced_state_len - 1] == BUSY);
+    DROP(thr_info->forced_state);
 
     pthread_mutex_unlock(&state.mutex);
 }
@@ -419,8 +448,8 @@ static void print_block_map()
             sem_info = libidle_find_sem_info(thr_info->waiting_semaphore);
         if (i) printf("|");
         printf(
-            thr_info->forced_busy ? "B" : // forced busy
-            thr_info->forced_idle ? "i" : // forced idle
+            (thr_info->forced_state_len > 0 && thr_info->forced_state_ptr[0] == BUSY) ? "B" : // forced busy
+            (thr_info->forced_state_len > 0 && thr_info->forced_state_ptr[0] == IDLE) ? "i" : // forced idle
             (!thr_info->sleeping) ? "-" : // computing
             (!thr_info->waiting_semaphore) ? "b" : // blocking busy
             !sem_info ? "?" : // sleeping on an unknown semaphore
@@ -548,8 +577,7 @@ sem_t *sem_open(const char *name, int oflag, ...)
     pthread_mutex_lock(&state.mutex);
 
     // register semaphore in SemaphoreInfo list
-    state.sem_info_ptr = realloc(state.sem_info_ptr, sizeof(SemaphoreInfo) * ++state.sem_info_len);
-    state.sem_info_ptr[state.sem_info_len - 1] = (SemaphoreInfo) { .sem = ret, .named_semaphore = true };
+    PUSH(state.sem_info) = (SemaphoreInfo) { .sem = ret, .named_semaphore = true };
 
     pthread_mutex_unlock(&state.mutex);
 
@@ -574,8 +602,7 @@ int sem_init_225(sem_t *sem, int pshared, unsigned int value)
     pthread_mutex_lock(&state.mutex);
 
     // register semaphore in SemaphoreInfo list
-    state.sem_info_ptr = realloc(state.sem_info_ptr, sizeof(SemaphoreInfo) * ++state.sem_info_len);
-    state.sem_info_ptr[state.sem_info_len - 1] = (SemaphoreInfo) { .sem = sem, .pending_wakeups = value };
+    PUSH(state.sem_info) = (SemaphoreInfo) { .sem = sem, .pending_wakeups = value };
 
     pthread_mutex_unlock(&state.mutex);
 
@@ -596,7 +623,7 @@ int sem_destroy_225(sem_t *sem)
         {
             // swap with last entry and shrink
             *sem_info = state.sem_info_ptr[state.sem_info_len - 1];
-            state.sem_info_ptr = realloc(state.sem_info_ptr, sizeof(SemaphoreInfo) * --state.sem_info_len);
+            DROP(state.sem_info);
             break;
         }
     }
@@ -716,16 +743,14 @@ int pthread_cond_init_232(pthread_cond_t *restrict cond, const pthread_condattr_
     // printf("  register %p\n", cond);
 
     // register condition in ConditionInfo list
-    state.cond_info_ptr = realloc(state.cond_info_ptr, sizeof(ConditionInfo) * ++state.cond_info_len);
-    ConditionInfo *info = &state.cond_info_ptr[state.cond_info_len - 1];
-
-    *info = (ConditionInfo) {
+    PUSH(state.cond_info) = (ConditionInfo) {
         .cond = cond,
         .in = malloc(sizeof(sem_t)),
         .out = malloc(sizeof(sem_t)),
         .signaled = malloc(sizeof(bool)),
         .sleeping_threads = 0,
     };
+    ConditionInfo *info = &state.cond_info_ptr[state.cond_info_len - 1];
     // our own function - not next_!
     sem_init_225(info->in, 0, 0);
     sem_init_225(info->out, 0, 0);
@@ -759,7 +784,7 @@ int pthread_cond_destroy_232(pthread_cond_t *cond)
 
             // swap with last entry and shrink
             *cond_info = state.cond_info_ptr[state.cond_info_len - 1];
-            state.cond_info_ptr = realloc(state.cond_info_ptr, sizeof(ConditionInfo) * --state.cond_info_len);
+            DROP(state.cond_info);
             break;
         }
     }
