@@ -68,6 +68,9 @@ This is because the outmost code is usually the code that knows its intentions t
 
 Keep in mind that **any enable call must be paired with a matching disable call, in stack order**.
 
+### Important Warning!
+Be exceedingly careful when combining forced idle with condition waits - doing so can break the idleness logic!
+
 ## Details
 ### Implementing Condition Variables with Semaphores
 
