@@ -26,7 +26,7 @@
     array ## _ptr[array ## _len - 1]
 
 /// Decrease the length of this array by 1.
-#define DROP(array) array ## _ptr = realloc(array ## _ptr, sizeof(*array ## _ptr) * --array ## _len);
+#define DROP(array) array ## _ptr = realloc(array ## _ptr, sizeof(*array ## _ptr) * --array ## _len)
 
 static int (*next_accept)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 static int (*next_nanosleep)(const struct timespec *req, struct timespec *rem);
@@ -98,18 +98,18 @@ typedef struct {
  */
 enum ForcedState {
     /**
-    * Forces the thread to remain marked as busy even if it is blocked.
-    * This is so that things like HTTP clients can remain busy while
-    * receiving a response. This is because waiting for a response to an
-    * internally triggered request is not a source of idleness.
-    * Has priority over forced_idle.
-    */
+     * Forces the thread to remain marked as busy even if it is blocked.
+     * This is so that things like HTTP clients can remain busy while
+     * receiving a response. This is because waiting for a response to an
+     * internally triggered request is not a source of idleness.
+     * Has priority over forced_idle.
+     */
     BUSY,
     /**
-      * Forces the thread to remain marked as idle even if it is "awake".
-      * This is so that things like message receive loops can avoid incrementing
-      * the idle counter until they've received and dispatched a full message.
-      */
+     * Forces the thread to remain marked as idle even if it is "awake".
+     * This is so that things like message receive loops can avoid incrementing
+     * the idle counter until they've received and dispatched a full message.
+     */
     IDLE,
 };
 
