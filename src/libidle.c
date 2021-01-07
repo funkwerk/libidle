@@ -81,13 +81,15 @@ typedef struct {
  * This is so that all threads that are currently using the OUT semaphore to sleep
  * finish touching it.
  * Finally, we can now free the two semaphores and return.
+ *
+ * Note that timeouts introduce a hole in this design, which is patched by "bool *signaled".
  */
 typedef struct {
     pthread_cond_t *cond;
     // TODO one struct for all three (ConditionEventInfo?)
     // malloced because it needs to be stable across reallocs
     sem_t *in, *out;
-    // set to true once the thread has been signaled, to allow us to collect and post late
+    // set to true once the condition has been signaled, to allow us to collect and post late
     bool *signaled;
     int sleeping_threads;
 } ConditionInfo;
@@ -109,6 +111,9 @@ enum ForcedState {
      * Forces the thread to remain marked as idle even if it is "awake".
      * This is so that things like message receive loops can avoid incrementing
      * the idle counter until they've received and dispatched a full message.
+     *
+     * Note that this should *never* be used to mark blocks that may wake
+     * up in response to a signal.
      */
     IDLE,
 };
@@ -655,6 +660,8 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
 /**
  * When we signal a semaphore, we don't know which sleeping semaphore will wake up.
  * Because of this, we must track additionally the number of *pending* wakeups.
+ * The goal of this is to bridge the gap between the signalling thread going
+ * idle and the sleeping thread waking up.
  * This is incremented in sem_post.
  * Conversely, sem_wait decrements.
  */
@@ -699,14 +706,34 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     // EINTR == interrupted by a system call, just retry with the same parameters
     do
     {
-      if (timedwait)
-      {
-          ret = next_sem_timedwait(sem, abs_timeout);
-      }
-      else
-      {
-          ret = next_sem_wait(sem);
-      }
+        if (timedwait)
+        {
+            // we compensate for issues with faketime by
+            // manually checking the clock.
+            while (true)
+            {
+                ret = next_sem_timedwait(sem, abs_timeout);
+                if (ret == -1 && errno == ETIMEDOUT)
+                {
+                    struct timespec ts;
+                    // "The timeout shall be based on the CLOCK_REALTIME clock."
+                    // -- POSIX spec, sem_timedwait
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    if (ts.tv_sec < abs_timeout->tv_sec
+                        || (ts.tv_sec == abs_timeout->tv_sec
+                            && ts.tv_nsec < abs_timeout->tv_nsec))
+                    {
+                        // timeout hasn't actually elapsed yet
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+        else
+        {
+            ret = next_sem_wait(sem);
+        }
     }
     while (ret == -1 && errno == EINTR);
 
