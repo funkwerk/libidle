@@ -6,6 +6,7 @@
 #include <execinfo.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -135,6 +136,16 @@ static struct {
     // locks access to state
     pthread_mutex_t mutex;
 
+    /*
+     * To avoid a deadlock if a libidle function is interrupted by a signal while
+     * holding the lock, we block all signals while the mutex is locked.
+     * The original_mask field is used to restore the previous set of signals
+     * after the lock has been released.
+     * (Prompted by issues with parallel garbage collection in D 2.090. D uses signals
+     * to freeze all but one thread. The frozen threads may be in libidle operations.)
+     */
+    sigset_t original_mask;
+
     int filedes;
     bool locked;
     int times_idle;
@@ -238,9 +249,26 @@ static void libidle_unlock()
     state.locked = false;
 }
 
+static void libidle_lock_state_mutex()
+{
+    // block all signals while locked. prevents deadlocks if signal interrupts in in mid-operation.
+    sigset_t all_signals, original_mask;
+    sigfillset(&all_signals);
+    pthread_sigmask(SIG_SETMASK, &all_signals, &original_mask);
+    pthread_mutex_lock(&state.mutex);
+    state.original_mask = original_mask;
+}
+
+static void libidle_unlock_state_mutex()
+{
+    sigset_t original_mask = state.original_mask;
+    pthread_mutex_unlock(&state.mutex);
+    pthread_sigmask(SIG_SETMASK, &original_mask, NULL);
+}
+
 static void libidle_register_thread(pthread_t thread)
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
     PUSH(state.thr_info) = (ThreadInfo) {
         .id = thread,
         .sleeping = false,
@@ -248,12 +276,12 @@ static void libidle_register_thread(pthread_t thread)
         .forced_state_len = 0,
         .waiting_semaphore = NULL,
     };
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 }
 
 static void libidle_unregister_thread(pthread_t thread)
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
     for (int i = 0; i < state.thr_info_len; i++)
     {
         ThreadInfo *thr_info = &state.thr_info_ptr[i];
@@ -265,7 +293,7 @@ static void libidle_unregister_thread(pthread_t thread)
             break;
         }
     }
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 }
 
 __attribute__ ((constructor))
@@ -304,32 +332,32 @@ void libidle_init()
 
 static void entering_blocked_op()
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     ThreadInfo *thr_info = find_thread_info();
     if (thr_info) thr_info->sleeping = true;
     if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE)
         maybe_unlock();
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 }
 
 static void left_blocked_op()
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     ThreadInfo *thr_info = find_thread_info();
     if (thr_info) thr_info->sleeping = false;
     if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE)
         maybe_lock();
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 }
 
 // equivalent to entering a blocked op
 void libidle_enable_forced_idle()
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
@@ -338,13 +366,13 @@ void libidle_enable_forced_idle()
 
     maybe_unlock();
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 }
 
 // equivalent to leaving a blocked op
 void libidle_disable_forced_idle()
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
@@ -354,12 +382,12 @@ void libidle_disable_forced_idle()
 
     maybe_lock();
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 }
 
 void libidle_enable_forced_busy()
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
@@ -371,12 +399,12 @@ void libidle_enable_forced_busy()
     backtrace(buffer, 16);
     backtrace_symbols_fd(buffer, 16, 1);*/
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 }
 
 void libidle_disable_forced_busy()
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     ThreadInfo *thr_info = find_thread_info();
     assert(thr_info);
@@ -384,7 +412,7 @@ void libidle_disable_forced_busy()
     assert(thr_info->forced_state_len > 0 && thr_info->forced_state_ptr[thr_info->forced_state_len - 1] == BUSY);
     DROP(thr_info->forced_state);
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 }
 
 static void maybe_lock()
@@ -579,12 +607,12 @@ sem_t *sem_open(const char *name, int oflag, ...)
     }
     if (ret == SEM_FAILED) return ret;
 
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     // register semaphore in SemaphoreInfo list
     PUSH(state.sem_info) = (SemaphoreInfo) { .sem = ret, .named_semaphore = true };
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 
     return 0;
 }
@@ -604,12 +632,12 @@ int sem_init_225(sem_t *sem, int pshared, unsigned int value)
     int ret = next_sem_init(sem, pshared, value);
     if (ret != 0) return ret;
 
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     // register semaphore in SemaphoreInfo list
     PUSH(state.sem_info) = (SemaphoreInfo) { .sem = sem, .pending_wakeups = value };
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 
     return 0;
 }
@@ -618,7 +646,7 @@ int sem_destroy_225(sem_t *sem)
 {
     NON_NULL(next_sem_destroy);
 
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     // TODO iterate backwards- faster? more recently created sems are likely to be at the back
     for (int i = 0; i < state.sem_info_len; i++)
@@ -634,7 +662,7 @@ int sem_destroy_225(sem_t *sem)
     }
     // should assert we actually freed something rn... meh
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 
     return next_sem_destroy(sem);
 }
@@ -643,14 +671,14 @@ int sem_post_225(sem_t *sem)
 {
     NON_NULL(next_sem_post);
 
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     SemaphoreInfo *sem_info = libidle_find_sem_info(sem);
 
     assert(sem_info);
     sem_info->pending_wakeups++;
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 
     return next_sem_post(sem);
 }
@@ -680,7 +708,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     NON_NULL(next_sem_wait);
     NON_NULL(next_sem_timedwait);
 
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     SemaphoreInfo *sem_info = libidle_find_sem_info(sem);
     bool is_named_semaphore = sem_info->named_semaphore;
@@ -694,7 +722,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
         thr_info->waiting_semaphore = sem;
     }
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 
     if (!is_named_semaphore)
     {
@@ -747,7 +775,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
      */
     if (!is_named_semaphore)
     {
-        pthread_mutex_lock(&state.mutex);
+        libidle_lock_state_mutex();
 
         left_blocked_op();
 
@@ -758,7 +786,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
         thr_info->waiting_semaphore = NULL;
         sem_info->pending_wakeups--;
 
-        pthread_mutex_unlock(&state.mutex);
+        libidle_unlock_state_mutex();
     }
 
     return ret;
@@ -766,7 +794,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
 
 int pthread_cond_init_232(pthread_cond_t *restrict cond, const pthread_condattr_t *restrict attr)
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
     // printf("  register %p\n", cond);
 
     // register condition in ConditionInfo list
@@ -783,7 +811,7 @@ int pthread_cond_init_232(pthread_cond_t *restrict cond, const pthread_condattr_
     sem_init_225(info->out, 0, 0);
     *info->signaled = false;
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 
     return 0;
 }
@@ -792,7 +820,7 @@ int pthread_cond_destroy_232(pthread_cond_t *cond)
 {
     NON_NULL(next_pthread_cond_destroy);
 
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     // TODO iterate backwards- faster? more recently created condvars are likely to be at the back
     for (int i = 0; i < state.cond_info_len; i++)
@@ -817,7 +845,7 @@ int pthread_cond_destroy_232(pthread_cond_t *cond)
     }
     // should assert we actually freed something rn... meh
 
-    pthread_mutex_unlock(&state.mutex);
+    libidle_unlock_state_mutex();
 
     return next_pthread_cond_destroy(cond);
 }
@@ -825,7 +853,7 @@ int pthread_cond_destroy_232(pthread_cond_t *cond)
 int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex,
     const struct timespec *restrict abstime)
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     // mutex is locked here per condition semantics. however, we can safely release it at this
     // point because we hold state.mutex anyway.
@@ -840,7 +868,7 @@ int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *r
     sem_t *in = cond_info->in, *out = cond_info->out;
     bool *signaled = cond_info->signaled;
 
-    pthread_mutex_unlock(&state.mutex); // all state modifications are done.
+    libidle_unlock_state_mutex(); // all state modifications are done.
 
     int ret;
     if (abstime)
@@ -849,7 +877,7 @@ int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *r
         if (ret == -1 && errno == ETIMEDOUT)
         {
             // printf("! ! ! timeout case\n");
-            pthread_mutex_lock(&state.mutex);
+            libidle_lock_state_mutex();
             if (*signaled)
             {
                 // printf("? ? ? already signaled\n");
@@ -867,7 +895,7 @@ int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *r
                 cond_info = libidle_find_cond_info(cond);
                 cond_info->sleeping_threads--;
             }
-            pthread_mutex_unlock(&state.mutex);
+            libidle_unlock_state_mutex();
 
             pthread_mutex_lock(mutex);
 
@@ -896,7 +924,7 @@ int pthread_cond_wait_232(pthread_cond_t *restrict cond, pthread_mutex_t *restri
 
 int pthread_cond_broadcast_232(pthread_cond_t *cond)
 {
-    pthread_mutex_lock(&state.mutex);
+    libidle_lock_state_mutex();
 
     ConditionInfo *cond_info = libidle_find_cond_info(cond);
     ThreadInfo *thr_info = libidle_find_thr_info(pthread_self());
@@ -925,7 +953,7 @@ int pthread_cond_broadcast_232(pthread_cond_t *cond)
         sem_post_225(in);
     }
     *signaled = true;
-    pthread_mutex_unlock(&state.mutex); // done with state mutation
+    libidle_unlock_state_mutex(); // done with state mutation
 
     // printf("> collect tokens\n");
     for (int i = 0; i < were_sleeping; i++)
