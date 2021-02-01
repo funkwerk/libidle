@@ -135,6 +135,9 @@ static struct {
 
     // locks access to state
     pthread_mutex_t mutex;
+    // since the mutex is recursive, we count the number of locks here
+    // (this is used for restoring signal state on the last unlock)
+    int mutex_locks;
 
     /*
      * To avoid a deadlock if a libidle function is interrupted by a signal while
@@ -147,6 +150,7 @@ static struct {
     sigset_t original_mask;
 
     int filedes;
+    // file locked
     bool locked;
     int times_idle;
     bool verbose;
@@ -252,18 +256,32 @@ static void libidle_unlock()
 static void libidle_lock_state_mutex()
 {
     // block all signals while locked. prevents deadlocks if signal interrupts in in mid-operation.
+    // state.mutex_locks is used to only store/reset the sigmask on the outermost lock/unlock
+    // we call pthread_sigmask even if we're already locked (because we can't access state.mutex_locks
+    // without the lock), but those calls have no issue since they don't corrupt the original_mask.
     sigset_t all_signals, original_mask;
     sigfillset(&all_signals);
     pthread_sigmask(SIG_SETMASK, &all_signals, &original_mask);
     pthread_mutex_lock(&state.mutex);
-    state.original_mask = original_mask;
+    state.mutex_locks ++;
+
+    if (state.mutex_locks == 1)
+    {
+        // outermost lock
+        state.original_mask = original_mask;
+    }
 }
 
 static void libidle_unlock_state_mutex()
 {
+    bool was_outermost_lock = (state.mutex_locks == 1) ? true : false;
     sigset_t original_mask = state.original_mask;
+    state.mutex_locks --;
     pthread_mutex_unlock(&state.mutex);
-    pthread_sigmask(SIG_SETMASK, &original_mask, NULL);
+    if (was_outermost_lock)
+    {
+        pthread_sigmask(SIG_SETMASK, &original_mask, NULL);
+    }
 }
 
 static void libidle_register_thread(pthread_t thread)
@@ -322,6 +340,7 @@ void libidle_init()
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&state.mutex, &attr);
     pthread_mutexattr_destroy(&attr);
+    state.mutex_locks = 0;
 
     state.filedes = open(statefile, O_RDWR | O_CREAT | O_TRUNC, 0600);
     state.verbose = getenv("LIBIDLE_VERBOSE") ? true : false;
