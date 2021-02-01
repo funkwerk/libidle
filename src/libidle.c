@@ -561,6 +561,8 @@ struct ActualThreadInfo
 
 void *thread_wrapper(void *arg)
 {
+    libidle_register_thread(pthread_self());
+
     struct ActualThreadInfo actual_thread_info = *(struct ActualThreadInfo*) arg;
 
     free(arg);
@@ -585,12 +587,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         .arg = arg,
     };
 
-    int ret = next_pthread_create(thread, attr, thread_wrapper, actual_thread_info);
-    if (ret == 0)
-    {
-        libidle_register_thread(*thread);
-    }
-    return ret;
+    return next_pthread_create(thread, attr, thread_wrapper, actual_thread_info);
 }
 
 int pthread_join(pthread_t thread, void **retval)
