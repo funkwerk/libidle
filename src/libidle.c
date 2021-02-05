@@ -93,6 +93,7 @@ typedef struct {
     // set to true once the condition has been signaled, to allow us to collect and post late
     bool *signaled;
     int sleeping_threads;
+    clockid_t clock;
 } ConditionInfo;
 
 /**
@@ -699,7 +700,7 @@ int sem_post_225(sem_t *sem)
     return next_sem_post(sem);
 }
 
-static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *abs_timeout);
+static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *abs_timeout, const clockid_t clock);
 
 /**
  * When we signal a semaphore, we don't know which sleeping semaphore will wake up.
@@ -711,15 +712,17 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
  */
 int sem_wait_225(sem_t *sem)
 {
-    return libidle_sem_wait(false, sem, NULL);
+    return libidle_sem_wait(false, sem, NULL, 0);
 }
 
 int sem_timedwait_225(sem_t *sem, const struct timespec *abs_timeout)
 {
-    return libidle_sem_wait(true, sem, abs_timeout);
+    // "The timeout shall be based on the CLOCK_REALTIME clock."
+    // -- POSIX spec, sem_timedwait
+    return libidle_sem_wait(true, sem, abs_timeout, CLOCK_REALTIME);
 }
 
-static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *abs_timeout)
+static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *abs_timeout, const clockid_t clock)
 {
     NON_NULL(next_sem_wait);
     NON_NULL(next_sem_timedwait);
@@ -760,9 +763,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
                 if (ret == -1 && errno == ETIMEDOUT)
                 {
                     struct timespec ts;
-                    // "The timeout shall be based on the CLOCK_REALTIME clock."
-                    // -- POSIX spec, sem_timedwait
-                    clock_gettime(CLOCK_REALTIME, &ts);
+                    clock_gettime(clock, &ts);
                     if (ts.tv_sec < abs_timeout->tv_sec
                         || (ts.tv_sec == abs_timeout->tv_sec
                             && ts.tv_nsec < abs_timeout->tv_nsec))
@@ -813,6 +814,12 @@ int pthread_cond_init_232(pthread_cond_t *restrict cond, const pthread_condattr_
     libidle_lock_state_mutex();
     // printf("  register %p\n", cond);
 
+    clockid_t clock = CLOCK_REALTIME;
+    if (attr)
+    {
+        pthread_condattr_getclock(attr, &clock);
+    }
+
     // register condition in ConditionInfo list
     PUSH(state.cond_info) = (ConditionInfo) {
         .cond = cond,
@@ -820,6 +827,7 @@ int pthread_cond_init_232(pthread_cond_t *restrict cond, const pthread_condattr_
         .out = malloc(sizeof(sem_t)),
         .signaled = malloc(sizeof(bool)),
         .sleeping_threads = 0,
+        .clock = clock,
     };
     ConditionInfo *info = &state.cond_info_ptr[state.cond_info_len - 1];
     // our own function - not next_!
@@ -883,13 +891,14 @@ int pthread_cond_timedwait_232(pthread_cond_t *restrict cond, pthread_mutex_t *r
     cond_info->sleeping_threads++;
     sem_t *in = cond_info->in, *out = cond_info->out;
     bool *signaled = cond_info->signaled;
+    clockid_t clock = cond_info->clock;
 
     libidle_unlock_state_mutex(); // all state modifications are done.
 
     int ret;
     if (abstime)
     {
-        ret = sem_timedwait_225(in, abstime);
+        ret = libidle_sem_wait(true, in, abstime, clock);
         if (ret == -1 && errno == ETIMEDOUT)
         {
             // printf("! ! ! timeout case\n");
