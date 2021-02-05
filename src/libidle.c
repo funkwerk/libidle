@@ -558,15 +558,19 @@ struct ActualThreadInfo
 {
     void *(*start_routine)(void*);
     void *arg;
+    sem_t *started;
 };
 
 void *thread_wrapper(void *arg)
 {
+    NON_NULL(next_sem_post);
     libidle_register_thread(pthread_self());
+
+    // now that we're registered, pthread_create can return
 
     struct ActualThreadInfo actual_thread_info = *(struct ActualThreadInfo*) arg;
 
-    free(arg);
+    next_sem_post(actual_thread_info.started);
 
     void *ret; // pthread_cleanup_push and _pop are actually macros with unbalanced braces
 
@@ -580,15 +584,30 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         void *(*start_routine) (void *), void *arg)
 {
     NON_NULL(next_pthread_create);
+    NON_NULL(next_sem_init);
+    NON_NULL(next_sem_wait);
+    NON_NULL(next_sem_destroy);
 
     struct ActualThreadInfo *actual_thread_info = malloc(sizeof(struct ActualThreadInfo));
 
     *actual_thread_info = (struct ActualThreadInfo) {
         .start_routine = start_routine,
         .arg = arg,
+        .started = malloc(sizeof(sem_t)),
     };
+    next_sem_init(actual_thread_info->started, 0, 0);
 
-    return next_pthread_create(thread, attr, thread_wrapper, actual_thread_info);
+    int ret = next_pthread_create(thread, attr, thread_wrapper, actual_thread_info);
+    if (ret == 0)
+    {
+        // wait for the child thread to be started and registered so we don't prematurely unlock during startup
+        next_sem_wait(actual_thread_info->started);
+        next_sem_destroy(actual_thread_info->started);
+        free(actual_thread_info->started);
+        // child thread will have copied it
+        free(actual_thread_info);
+    }
+    return ret;
 }
 
 int pthread_join(pthread_t thread, void **retval)
