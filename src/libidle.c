@@ -30,7 +30,6 @@
 #define DROP(array) array ## _ptr = realloc(array ## _ptr, sizeof(*array ## _ptr) * --array ## _len)
 
 static int (*next_accept)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
-static int (*next_nanosleep)(const struct timespec *req, struct timespec *rem);
 static int (*next_pthread_cond_destroy)(pthread_cond_t *cond);
 static int (*next_pthread_cond_init)(pthread_cond_t *restrict cond, const pthread_condattr_t *restrict attr);
 static int (*next_pthread_create)(pthread_t *thread, const pthread_attr_t *attr,
@@ -321,7 +320,6 @@ void libidle_init()
     if (state.initialized) return;
 
     next_accept = dlsym(RTLD_NEXT, "accept");
-    next_nanosleep = dlsym(RTLD_NEXT, "nanosleep");
     next_pthread_cond_destroy = dlvsym(RTLD_NEXT, "pthread_cond_destroy", "GLIBC_2.3.2");
     next_pthread_cond_init = dlvsym(RTLD_NEXT, "pthread_cond_init", "GLIBC_2.3.2");
     next_pthread_create = dlsym(RTLD_NEXT, "pthread_create");
@@ -532,15 +530,6 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     NON_NULL(next_accept);
     entering_blocked_op();
     int ret = next_accept(sockfd, addr, addrlen);
-    left_blocked_op();
-    return ret;
-}
-
-int nanosleep(const struct timespec *req, struct timespec *rem)
-{
-    NON_NULL(next_nanosleep);
-    entering_blocked_op();
-    int ret = next_nanosleep(req, rem);
     left_blocked_op();
     return ret;
 }
