@@ -34,7 +34,6 @@ function expect_not_locked() {
 # one call: accept
 expect_locked 'build/accept' '1'
 expect_locked 'build/sem_wait' '1'
-expect_locked 'build/nanosleep' '1'
 # this cluster of tests bounces a signal between two threads. the check is that we should not
 # go idle at any point during it.
 expect_not_locked 'build/sem_post'

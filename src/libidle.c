@@ -612,6 +612,9 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     };
     next_sem_init(actual_thread_info->started, 0, 0);
 
+    // Despite blocking on a semaphore, we are busy: the other end of the semaphore is dangling
+    // until next_pthread_create completes.
+    libidle_enable_forced_busy();
     int ret = next_pthread_create(thread, attr, thread_wrapper, actual_thread_info);
     if (ret == 0)
     {
@@ -622,6 +625,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         // child thread will have copied it
         free(actual_thread_info);
     }
+    libidle_disable_forced_busy();
     return ret;
 }
 
