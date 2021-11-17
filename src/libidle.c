@@ -370,7 +370,7 @@ static void entering_blocked_op(const char *fmt, ...)
     ThreadInfo *thr_info = find_thread_info();
     assert(!thr_info || thr_info->sleeping == false);
     if (thr_info) thr_info->sleeping = true;
-    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE) {
+    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != BUSY) {
         va_list args;
         va_start(args, fmt);
         vmaybe_unlock(fmt, args);
@@ -387,7 +387,7 @@ static void left_blocked_op(const char *fmt, ...)
     ThreadInfo *thr_info = find_thread_info();
     assert(!thr_info || thr_info->sleeping == true);
     if (thr_info) thr_info->sleeping = false;
-    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE) {
+    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != BUSY) {
         va_list args;
         va_start(args, fmt);
         vmaybe_lock(fmt, args);
