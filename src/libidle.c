@@ -41,6 +41,7 @@ static sem_t *(*next_sem_open)(const char *name, int oflag, ...);
 static int (*next_sem_post)(sem_t *sem);
 static int (*next_sem_timedwait)(sem_t *sem, const struct timespec *abs_timeout);
 static int (*next_sem_wait)(sem_t *sem);
+static int (*next_pthread_setname_np)(pthread_t thread, const char *name);
 
 /**
  * Records the number of pending wakeups on a semaphore
@@ -125,6 +126,7 @@ typedef struct {
 
     size_t forced_state_len;
     enum ForcedState *forced_state_ptr;
+    const char *name;
 
     // non-null when waiting on a semaphore, requires sleeping=true
     sem_t *waiting_semaphore;
@@ -166,8 +168,20 @@ static struct {
 } state = { 0 };
 
 static ThreadInfo *find_thread_info();
-static void maybe_lock();
-static void maybe_unlock();
+static void vmaybe_lock(const char *fmt, va_list ap);
+static void vmaybe_unlock(const char *fmt, va_list ap);
+static void maybe_lock(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vmaybe_unlock(fmt, args);
+    va_end(args);
+}
+static void maybe_unlock(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vmaybe_unlock(fmt, args);
+  va_end(args);
+}
 static void print_block_map();
 static int num_active_threads();
 
@@ -330,6 +344,7 @@ void libidle_init()
     next_sem_post = dlvsym(RTLD_NEXT, "sem_post", "GLIBC_2.2.5");
     next_sem_timedwait = dlvsym(RTLD_NEXT, "sem_timedwait", "GLIBC_2.2.5");
     next_sem_wait = dlvsym(RTLD_NEXT, "sem_wait", "GLIBC_2.2.5");
+    next_pthread_setname_np = dlvsym(RTLD_NEXT, "pthread_setname_np", "GLIBC_2.12");
 
     char *statefile = getenv("LIBIDLE_STATEFILE");
     if (!statefile) statefile = ".libidle_state";
@@ -348,26 +363,36 @@ void libidle_init()
     state.initialized = true;
 }
 
-static void entering_blocked_op()
+static void entering_blocked_op(const char *fmt, ...)
 {
     libidle_lock_state_mutex();
 
     ThreadInfo *thr_info = find_thread_info();
+    assert(!thr_info || thr_info->sleeping == false);
     if (thr_info) thr_info->sleeping = true;
-    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE)
-        maybe_unlock();
+    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE) {
+        va_list args;
+        va_start(args, fmt);
+        vmaybe_unlock(fmt, args);
+        va_end(args);
+    }
 
     libidle_unlock_state_mutex();
 }
 
-static void left_blocked_op()
+static void left_blocked_op(const char *fmt, ...)
 {
     libidle_lock_state_mutex();
 
     ThreadInfo *thr_info = find_thread_info();
+    assert(!thr_info || thr_info->sleeping == true);
     if (thr_info) thr_info->sleeping = false;
-    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE)
-        maybe_lock();
+    if (!thr_info || thr_info->forced_state_len == 0 || thr_info->forced_state_ptr[0] != IDLE) {
+        va_list args;
+        va_start(args, fmt);
+        vmaybe_lock(fmt, args);
+        va_end(args);
+    }
 
     libidle_unlock_state_mutex();
 }
@@ -382,7 +407,7 @@ void libidle_enable_forced_idle()
 
     PUSH(thr_info->forced_state) = IDLE;
 
-    maybe_unlock();
+    maybe_unlock("libidle_enable_forced_idle()\n");
 
     libidle_unlock_state_mutex();
 }
@@ -398,7 +423,7 @@ void libidle_disable_forced_idle()
     assert(thr_info->forced_state_len > 0 && thr_info->forced_state_ptr[thr_info->forced_state_len - 1] == IDLE);
     DROP(thr_info->forced_state);
 
-    maybe_lock();
+    maybe_lock("libidle_disable_forced_idle()\n");
 
     libidle_unlock_state_mutex();
 }
@@ -433,7 +458,7 @@ void libidle_disable_forced_busy()
     libidle_unlock_state_mutex();
 }
 
-static void maybe_lock()
+static void vmaybe_lock(const char *fmt, va_list ap)
 {
     /**
      * It is not the case that leaving a blocking op necessarily acquires lock.
@@ -443,8 +468,9 @@ static void maybe_lock()
      */
     if (state.verbose)
     {
-        printf("%lu: - block -> ", pthread_self());
         print_block_map();
+        printf(": %lx: -block: ", pthread_self());
+        vprintf(fmt, ap);
     }
     if (!state.locked && num_active_threads() > 0)
     {
@@ -456,12 +482,13 @@ static void maybe_lock()
     }
 }
 
-static void maybe_unlock()
+static void vmaybe_unlock(const char *fmt, va_list ap)
 {
     if (state.verbose)
     {
-        printf("%lu: + block -> ", pthread_self());
         print_block_map();
+        printf(": %lx: +block: ", pthread_self());
+        vprintf(fmt, ap);
     }
     if (state.locked && num_active_threads() == 0)
     {
@@ -508,7 +535,6 @@ static void print_block_map()
             "s"); // sleeping on a semaphore
         // printf(threadinfo_is_blocked(thr_info) ? "x" : "-");
     }
-    printf("\n");
 }
 
 static int num_active_threads()
@@ -528,9 +554,9 @@ static int num_active_threads()
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 {
     NON_NULL(next_accept);
-    entering_blocked_op();
+    entering_blocked_op("accept()\n");
     int ret = next_accept(sockfd, addr, addrlen);
-    left_blocked_op();
+    left_blocked_op("accept()\n");
     return ret;
 }
 
@@ -602,10 +628,32 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 int pthread_join(pthread_t thread, void **retval)
 {
     NON_NULL(next_pthread_join);
-    entering_blocked_op();
+    entering_blocked_op("pthread_join()\n");
     // TODO wakeup signalling on thread destruction
     int ret = next_pthread_join(thread, retval);
-    left_blocked_op();
+    left_blocked_op("pthread_join()\n");
+    return ret;
+}
+
+int pthread_setname_np(pthread_t thread, const char *name)
+{
+    NON_NULL(next_pthread_setname_np);
+    int ret = next_pthread_setname_np(thread, name);
+    libidle_lock_state_mutex();
+    for (int i = 0; i < state.thr_info_len; i++)
+    {
+        ThreadInfo *thr_info = &state.thr_info_ptr[i];
+        if (thr_info->id == thread)
+        {
+            for (int k = 0; k < i; k++) printf("  ");
+            printf("/ %s\n", name);
+            thr_info->name = name;
+            break;
+        }
+    }
+    print_block_map();
+    printf("\n");
+    libidle_unlock_state_mutex();
     return ret;
 }
 
@@ -753,7 +801,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
 
     if (!is_named_semaphore)
     {
-        entering_blocked_op();
+        entering_blocked_op("sem_wait()\n");
     }
 
     int ret;
@@ -802,7 +850,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     {
         libidle_lock_state_mutex();
 
-        left_blocked_op();
+        left_blocked_op("sem_wait()\n");
 
         // refind due to realloc
         thr_info = libidle_find_thr_info(pthread_self());
