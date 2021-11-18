@@ -790,11 +790,27 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     libidle_lock_state_mutex();
 
     SemaphoreInfo *sem_info = libidle_find_sem_info(sem);
-    bool is_named_semaphore = sem_info->named_semaphore;
     assert(sem_info);
+
+    bool is_named_semaphore = sem_info->named_semaphore;
 
     ThreadInfo *thr_info = libidle_find_thr_info(pthread_self());
     assert(thr_info);
+
+    if (thr_info->waiting_semaphore != NULL)
+    {
+        /**
+         * There's already a semaphore wait going on.
+         * This means we're being called from a signal handler, like the D GC handler.
+         * Signal handlers should not participate in libidle operation, since they
+         * are not part of the normal thread behavior.
+         * So just ignore this one. sem_post may indicate pending wakeups, but we don't
+         * need to consider them.
+         */
+        libidle_unlock_state_mutex();
+
+        return next_sem_wait(sem);
+    }
 
     if (!is_named_semaphore)
     {
