@@ -173,7 +173,7 @@ static void vmaybe_unlock(const char *fmt, va_list ap);
 static void maybe_lock(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    vmaybe_unlock(fmt, args);
+    vmaybe_lock(fmt, args);
     va_end(args);
 }
 static void maybe_unlock(const char *fmt, ...) {
