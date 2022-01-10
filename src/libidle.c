@@ -643,21 +643,24 @@ int pthread_setname_np(pthread_t thread, const char *name)
 {
     NON_NULL(next_pthread_setname_np);
     int ret = next_pthread_setname_np(thread, name);
-    libidle_lock_state_mutex();
-    for (int i = 0; i < state.thr_info_len; i++)
+    if (state.verbose)
     {
-        ThreadInfo *thr_info = &state.thr_info_ptr[i];
-        if (thr_info->id == thread)
-        {
-            for (int k = 0; k < i; k++) printf("  ");
-            printf("/ %s\n", name);
-            thr_info->name = name;
-            break;
-        }
+      libidle_lock_state_mutex();
+      for (int i = 0; i < state.thr_info_len; i++)
+      {
+          ThreadInfo *thr_info = &state.thr_info_ptr[i];
+          if (thr_info->id == thread)
+          {
+              for (int k = 0; k < i; k++) printf("  ");
+              printf("/ %s\n", name);
+              thr_info->name = name;
+              break;
+          }
+      }
+      print_block_map();
+      printf("\n");
+      libidle_unlock_state_mutex();
     }
-    print_block_map();
-    printf("\n");
-    libidle_unlock_state_mutex();
     return ret;
 }
 
