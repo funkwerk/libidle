@@ -632,6 +632,16 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 int pthread_join(pthread_t thread, void **retval)
 {
     NON_NULL(next_pthread_join);
+
+    ThreadInfo *thr_info = libidle_find_thr_info(pthread_self());
+    if (thr_info && thr_info->sleeping)
+    {
+        // Already in a blocking op, D GC handler, etc. etc. See libidle_sem_wait.
+        libidle_unlock_state_mutex();
+
+        return next_pthread_join(thread, retval);
+    }
+
     entering_blocked_op("pthread_join()\n");
     // TODO wakeup signalling on thread destruction
     int ret = next_pthread_join(thread, retval);
@@ -800,10 +810,10 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     ThreadInfo *thr_info = libidle_find_thr_info(pthread_self());
     assert(thr_info);
 
-    if (thr_info->waiting_semaphore != NULL)
+    if (thr_info->sleeping)
     {
         /**
-         * There's already a semaphore wait going on.
+         * There's already a blocking op going on.
          * This means we're being called from a signal handler, like the D GC handler.
          * Signal handlers should not participate in libidle operation, since they
          * are not part of the normal thread behavior.
